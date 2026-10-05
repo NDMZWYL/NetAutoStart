@@ -1,0 +1,261 @@
+# ============================================================
+# Campus Network (Ruijie) + WinRT Hotspot Auto Start Script
+# Target: Windows 10 / 11
+# Run as: Task Scheduler with highest privileges
+# ============================================================
+
+# ---------- CONFIG ----------
+$Config = @{
+    CampusExe            = "........."
+    CampusArgs           = ""
+    CampusProcessName    = "........."
+
+    LogDir               = "........."
+    LockFile             = "........."
+    LockExpireMinutes    = 10
+
+    MaxWaitSeconds       = 300
+    NetworkWaitSeconds   = 120
+    DriveWaitSeconds     = 60
+    RetryIntervalSeconds = 15
+    KillRetryCount       = 3
+
+    PingTargets          = @("8.8.8.8", "114.114.114.114", "223.5.5.5")
+    DnsTestHost          = "www.baidu.com"
+    HttpTestUrl          = "http://www.baidu.com"
+}
+
+# ---------- INIT ----------
+if (-not (Test-Path $Config.LogDir)) {
+    New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
+}
+$LogFile = Join-Path $Config.LogDir ("autostart_" + (Get-Date -Format "yyyyMMdd") + ".log")
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $line = "[$ts][$Level] $Message"
+    try { $line | Out-File -FilePath $LogFile -Append -Encoding UTF8 } catch {}
+    Write-Host $line
+}
+
+# ---------- LOCK ----------
+function Acquire-Lock {
+    if (Test-Path $Config.LockFile) {
+        $content = Get-Content $Config.LockFile -ErrorAction SilentlyContinue
+        if ($content -and $content.Count -ge 2) {
+            $pidFromFile  = $content[0].Trim()
+            $timeFromFile = $content[1].Trim()
+            $lockTime = [datetime]::Parse($timeFromFile)
+            $lockAlive = ((Get-Date) - $lockTime).TotalMinutes -lt $Config.LockExpireMinutes
+            $procAlive = $null -ne (Get-Process -Id $pidFromFile -ErrorAction SilentlyContinue)
+            if ($lockAlive -and $procAlive) {
+                Write-Log "Another instance is running (PID=$pidFromFile). Exiting." "WARN"
+                return $false
+            }
+        }
+        Remove-Item $Config.LockFile -Force -ErrorAction SilentlyContinue
+    }
+    "$PID`n$(Get-Date -Format 'o')" | Out-File $Config.LockFile -Encoding UTF8
+    return $true
+}
+
+function Release-Lock {
+    Remove-Item $Config.LockFile -Force -ErrorAction SilentlyContinue
+}
+
+# ---------- NETWORK TESTS ----------
+function Test-NetworkReady {
+    try {
+        $adapters = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.IPv4Address -and
+                $_.IPv4DefaultGateway -and
+                $_.NetAdapter.Status -eq "Up"
+            }
+        return ($null -ne $adapters -and @($adapters).Count -gt 0)
+    } catch { return $false }
+}
+
+function Test-PingOk {
+    foreach ($target in $Config.PingTargets) {
+        try {
+            if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
+function Test-DnsOk {
+    try {
+        $null = [System.Net.Dns]::GetHostAddresses($Config.DnsTestHost)
+        return $true
+    } catch { return $false }
+}
+
+function Test-HttpOk {
+    try {
+        $resp = Invoke-WebRequest -Uri $Config.HttpTestUrl -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        return ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400)
+    } catch { return $false }
+}
+
+function Test-FullInternet {
+    if (-not (Test-PingOk))   { return $false }
+    if (-not (Test-DnsOk))    { return $false }
+    if (-not (Test-HttpOk))   { return $false }
+    return $true
+}
+
+# ---------- CAMPUS AUTH ----------
+function Invoke-CampusAuth {
+    param([int]$RetryCount = 0)
+
+    if (-not (Test-Path $Config.CampusExe)) {
+        Write-Log "Campus exe not found: $($Config.CampusExe)" "ERROR"
+        return
+    }
+
+    $existing = Get-Process -Name $Config.CampusProcessName -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($RetryCount -ge $Config.KillRetryCount) {
+            Write-Log "Killing campus process after $RetryCount retries" "WARN"
+            $existing | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        } else {
+            Write-Log "Campus client already running (PID=$($existing.Id -join ',')). Skip."
+            return
+        }
+    }
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($Config.CampusArgs)) {
+            Start-Process -FilePath $Config.CampusExe -ErrorAction Stop
+        } else {
+            Start-Process -FilePath $Config.CampusExe -ArgumentList $Config.CampusArgs -ErrorAction Stop
+        }
+        Start-Sleep -Seconds 3
+        Write-Log "Campus client started"
+    } catch {
+        Write-Log "Failed to start campus client: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ---------- WINRT HOTSPOT ----------
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+
+Function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+
+function Start-Hotspot {
+    Write-Log "Starting WinRT hotspot..."
+
+    try {
+        $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+
+        if (-not $connectionProfile) {
+            Write-Log "Cannot get internet connection profile" "ERROR"
+            return
+        }
+
+        $tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($connectionProfile)
+
+        if (-not $tetheringManager) {
+            Write-Log "Cannot create tethering manager" "ERROR"
+            return
+        }
+
+        if ($tetheringManager.TetheringOperationalState -eq 1) {
+            Write-Log "Hotspot already ON"
+            return
+        }
+
+        $result = Await ($tetheringManager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+
+        if ($result.Status -eq 'Success') {
+            Write-Log "Hotspot started successfully"
+        } else {
+            Write-Log "Hotspot failed. Status=$($result.Status); Msg=$($result.AdditionalErrorMessage)" "ERROR"
+        }
+    } catch {
+        Write-Log "Hotspot exception: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+$startTime = Get-Date
+Write-Log "========== AutoNet script START =========="
+
+if (-not (Acquire-Lock)) { exit 0 }
+
+try {
+    # Stage 0: wait for A: drive and campus exe
+    $driveReady = $false
+    while (((Get-Date) - $startTime).TotalSeconds -lt $Config.DriveWaitSeconds) {
+        if (Test-Path $Config.CampusExe) {
+            $driveReady = $true
+            Write-Log "A drive and campus exe ready, elapsed $([int]((Get-Date) - $startTime).TotalSeconds)s"
+            break
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $driveReady) {
+        Write-Log "Timeout waiting for A drive / campus exe ($($Config.DriveWaitSeconds)s)" "ERROR"
+        exit 1
+    }
+
+    # Stage 1: wait for NIC ready (IP + gateway)
+    $networkReady = $false
+    while (((Get-Date) - $startTime).TotalSeconds -lt $Config.NetworkWaitSeconds) {
+        if (Test-NetworkReady) {
+            $networkReady = $true
+            Write-Log "NIC ready, elapsed $([int]((Get-Date) - $startTime).TotalSeconds)s"
+            break
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $networkReady) {
+        Write-Log "Timeout waiting for NIC" "ERROR"
+        exit 1
+    }
+
+    # Stage 2: loop auth until full internet is available
+    $internetOk = $false
+    $retry = 0
+    while (((Get-Date) - $startTime).TotalSeconds -lt $Config.MaxWaitSeconds) {
+        if (Test-FullInternet) {
+            $internetOk = $true
+            Write-Log "Internet OK, elapsed $([int]((Get-Date) - $startTime).TotalSeconds)s, checks=$retry"
+            break
+        }
+
+        $retry++
+        Write-Log "Attempt ${retry}: no internet, calling campus auth"
+        Invoke-CampusAuth -RetryCount $retry
+        Start-Sleep -Seconds $Config.RetryIntervalSeconds
+    }
+    if (-not $internetOk) {
+        Write-Log "Timeout: internet still down" "ERROR"
+        exit 1
+    }
+
+    # Stage 3: start hotspot
+    Write-Log "Starting hotspot..."
+    Start-Hotspot
+
+    Write-Log "========== AutoNet script END, total $([int]((Get-Date) - $startTime).TotalSeconds)s =========="
+    exit 0
+}
+finally {
+    Release-Lock
+}
